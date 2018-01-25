@@ -7,19 +7,17 @@ import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
 import android.content.ServiceConnection;
-import android.net.Uri;
 import android.os.Binder;
-import android.os.Build;
 import android.os.IBinder;
+import android.support.annotation.Nullable;
 import android.support.v4.app.NotificationCompat;
-import android.support.v4.content.FileProvider;
 import android.text.TextUtils;
 import android.widget.Toast;
 
 import com.vector.update_app.HttpManager;
 import com.vector.update_app.R;
 import com.vector.update_app.UpdateAppBean;
-import com.vector.update_app.utils.Utils;
+import com.vector.update_app.utils.AppUpdateUtils;
 
 import java.io.File;
 
@@ -35,7 +33,7 @@ public class DownloadService extends Service {
     private NotificationManager mNotificationManager;
     private DownloadBinder binder = new DownloadBinder();
     private NotificationCompat.Builder mBuilder;
-//    /**
+    //    /**
 //     * 开启服务方法
 //     *
 //     * @param context
@@ -44,6 +42,7 @@ public class DownloadService extends Service {
 //        Intent intent = new Intent(context, DownloadService.class);
 //        context.startService(intent);
 //    }
+    private boolean mDismissNotificationProgress = false;
 
     public static void bindService(Context context, ServiceConnection connection) {
         Intent intent = new Intent(context, DownloadService.class);
@@ -74,12 +73,17 @@ public class DownloadService extends Service {
      * 创建通知
      */
     private void setUpNotification() {
+        if (mDismissNotificationProgress) {
+            return;
+        }
+
         mBuilder = new NotificationCompat.Builder(this);
         mBuilder.setContentTitle("开始下载")
                 .setContentText("正在连接服务器")
-                .setSmallIcon(R.mipmap.update)
-                .setLargeIcon(Utils.drawableToBitmap(Utils.getAppIcon(DownloadService.this)))
+                .setSmallIcon(R.mipmap.lib_update_app_update_icon)
+                .setLargeIcon(AppUpdateUtils.drawableToBitmap(AppUpdateUtils.getAppIcon(DownloadService.this)))
                 .setOngoing(true)
+                .setAutoCancel(true)
                 .setWhen(System.currentTimeMillis());
         mNotificationManager.notify(NOTIFY_ID, mBuilder.build());
     }
@@ -88,36 +92,34 @@ public class DownloadService extends Service {
      * 下载模块
      */
     private void startDownload(UpdateAppBean updateApp, final DownloadCallback callback) {
-        String apkUrl = updateApp.getApk_file_url();
+
+        mDismissNotificationProgress = updateApp.isDismissNotificationProgress();
+
+        String apkUrl = updateApp.getApkFileUrl();
         if (TextUtils.isEmpty(apkUrl)) {
             String contentText = "新版本下载路径错误";
             stop(contentText);
             return;
         }
-        final String appName = apkUrl.substring(apkUrl.lastIndexOf("/") + 1, apkUrl.length());
+        String appName = AppUpdateUtils.getApkName(updateApp);
 
-        if (!appName.endsWith(".apk")) {
-            String contentText = "下载包有错误";
-            stop(contentText);
-            return;
-        }
         File appDir = new File(updateApp.getTargetPath());
         if (!appDir.exists()) {
             appDir.mkdirs();
         }
 
-        String target = appDir + File.separator + updateApp.getNew_version();
+        String target = appDir + File.separator + updateApp.getNewVersion();
 
-//        //可以利用md5验证是否重复下载
         updateApp.getHttpManager().download(apkUrl, target, appName, new FileDownloadCallBack(callback));
-
     }
 
     private void stop(String contentText) {
-        mBuilder.setContentTitle(Utils.getAppName(DownloadService.this)).setContentText(contentText);
-        Notification notification = mBuilder.build();
-        notification.flags = Notification.FLAG_AUTO_CANCEL;
-        mNotificationManager.notify(NOTIFY_ID, notification);
+        if (mBuilder != null) {
+            mBuilder.setContentTitle(AppUpdateUtils.getAppName(DownloadService.this)).setContentText(contentText);
+            Notification notification = mBuilder.build();
+            notification.flags = Notification.FLAG_AUTO_CANCEL;
+            mNotificationManager.notify(NOTIFY_ID, notification);
+        }
         close();
     }
 
@@ -130,14 +132,39 @@ public class DownloadService extends Service {
      * 进度条回调接口
      */
     public interface DownloadCallback {
+        /**
+         * 开始
+         */
         void onStart();
 
-        void onProgress(float progress);
+        /**
+         * 进度
+         *
+         * @param progress  进度 0.00 -1.00 ，总大小
+         * @param totalSize 总大小 单位B
+         */
+        void onProgress(float progress, long totalSize);
 
-        void setMax(float total);
+        /**
+         * 总大小
+         *
+         * @param totalSize 单位B
+         */
+        void setMax(long totalSize);
 
-        void onFinish();
+        /**
+         * 下载完了
+         *
+         * @param file 下载的app
+         * @return true ：下载完自动跳到安装界面，false：则不进行安装
+         */
+        boolean onFinish(File file);
 
+        /**
+         * 下载异常
+         *
+         * @param msg 异常信息
+         */
         void onError(String msg);
     }
 
@@ -149,10 +176,11 @@ public class DownloadService extends Service {
     public class DownloadBinder extends Binder {
         /**
          * 开始下载
+         *
+         * @param updateApp 新app信息
+         * @param callback  下载回调
          */
         public void start(UpdateAppBean updateApp, DownloadCallback callback) {
-            //初始化通知栏
-            setUpNotification();
             //下载
             startDownload(updateApp, callback);
         }
@@ -160,14 +188,17 @@ public class DownloadService extends Service {
 
     class FileDownloadCallBack implements HttpManager.FileCallback {
         private final DownloadCallback mCallBack;
+        int oldRate = 0;
 
-        public FileDownloadCallBack(DownloadCallback callback) {
+        public FileDownloadCallBack(@Nullable DownloadCallback callback) {
             super();
             this.mCallBack = callback;
         }
 
         @Override
         public void onBefore() {
+            //初始化通知栏
+            setUpNotification();
             if (mCallBack != null) {
                 mCallBack.onStart();
             }
@@ -175,16 +206,29 @@ public class DownloadService extends Service {
 
         @Override
         public void onProgress(float progress, long total) {
+            //做一下判断，防止自回调过于频繁，造成更新通知栏进度过于频繁，而出现卡顿的问题。
             int rate = Math.round(progress * 100);
-            if (mCallBack != null) {
-                mCallBack.setMax(total);
-                mCallBack.onProgress(progress * total);
+            if (oldRate != rate) {
+                if (mCallBack != null) {
+                    mCallBack.setMax(total);
+                    mCallBack.onProgress(progress, total);
+                }
+
+                if (mBuilder != null) {
+                    mBuilder.setContentTitle("正在下载：" + AppUpdateUtils.getAppName(DownloadService.this))
+                            .setContentText(rate + "%")
+                            .setProgress(100, rate, false)
+                            .setWhen(System.currentTimeMillis());
+                    Notification notification = mBuilder.build();
+                    notification.flags = Notification.FLAG_AUTO_CANCEL;
+                    mNotificationManager.notify(NOTIFY_ID, notification);
+                }
+
+                //重新赋值
+                oldRate = rate;
             }
-            mBuilder.setContentTitle("正在下载：" + Utils.getAppName(DownloadService.this))
-                    .setContentText(rate + "%")
-                    .setProgress(100, rate, false)
-                    .setWhen(System.currentTimeMillis());
-            mNotificationManager.notify(NOTIFY_ID, mBuilder.build());
+
+
         }
 
         @Override
@@ -205,45 +249,40 @@ public class DownloadService extends Service {
         @Override
         public void onResponse(File file) {
             if (mCallBack != null) {
-                mCallBack.onFinish();
+                if (!mCallBack.onFinish(file)) {
+                    close();
+                    return;
+                }
             }
 
-            Uri fileUri = FileProvider.getUriForFile(DownloadService.this, getApplicationContext().getPackageName() + ".fileProvider", file);
-            if (Utils.isAppOnForeground(DownloadService.this)) {
-                //App前台运行
-                mNotificationManager.cancel(NOTIFY_ID);
-                Intent intent = new Intent(Intent.ACTION_VIEW);
-                intent.setFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                    intent.setFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-                    intent.setDataAndType(fileUri, "application/vnd.android.package-archive");
+            try {
+
+                if (AppUpdateUtils.isAppOnForeground(DownloadService.this) || mBuilder == null) {
+                    //App前台运行
+                    mNotificationManager.cancel(NOTIFY_ID);
+                    AppUpdateUtils.installApp(DownloadService.this, file);
                 } else {
-                    intent.setDataAndType(Uri.fromFile(file), "application/vnd.android.package-archive");
+                    //App后台运行
+                    //更新参数,注意flags要使用FLAG_UPDATE_CURRENT
+                    Intent installAppIntent = AppUpdateUtils.getInstallAppIntent(DownloadService.this, file);
+                    PendingIntent contentIntent = PendingIntent.getActivity(DownloadService.this, 0, installAppIntent, PendingIntent.FLAG_UPDATE_CURRENT);
+                    mBuilder.setContentIntent(contentIntent)
+                            .setContentTitle(AppUpdateUtils.getAppName(DownloadService.this))
+                            .setContentText("下载完成，请点击安装")
+                            .setProgress(0, 0, false)
+                            //                        .setAutoCancel(true)
+                            .setDefaults((Notification.DEFAULT_ALL));
+                    Notification notification = mBuilder.build();
+                    notification.flags = Notification.FLAG_AUTO_CANCEL;
+                    mNotificationManager.notify(NOTIFY_ID, notification);
                 }
-                if (getPackageManager().queryIntentActivities(intent, 0).size() > 0) {
-                    startActivity(intent);
-                }
-            } else {
-                //App后台运行
-                Intent intent = new Intent(Intent.ACTION_VIEW);
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                    intent.setFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
-                    intent.setDataAndType(fileUri, "application/vnd.android.package-archive");
-                } else {
-                    intent.setDataAndType(Uri.fromFile(file), "application/vnd.android.package-archive");
-                }
-                //更新参数,注意flags要使用FLAG_UPDATE_CURRENT
-                PendingIntent contentIntent = PendingIntent.getActivity(DownloadService.this, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT);
-                mBuilder.setContentIntent(contentIntent)
-                        .setContentTitle(Utils.getAppName(DownloadService.this))
-                        .setContentText("下载完成，请点击安装")
-                        .setProgress(0, 0, false)
-                        .setAutoCancel(true)
-                        .setDefaults((Notification.DEFAULT_ALL));
-                mNotificationManager.notify(NOTIFY_ID, mBuilder.build());
+                //下载完自杀
+                close();
+            } catch (Exception e) {
+                e.printStackTrace();
+            } finally {
+                close();
             }
-            //下载完自杀
-            close();
         }
     }
 }
